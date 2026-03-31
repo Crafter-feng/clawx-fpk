@@ -1,469 +1,405 @@
 name: Build ClawX FPK
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'ClawX 版本（如 0.3.2）'
+        description: 'ClawX 版本（如 0.3.2），默认从 package.json 读取'
         required: false
-        default: '0.3.2'
-      arch:
-        description: '目标架构'
-        required: false
-        default: 'amd64,arm64'
-        type: choice
-        options:
-          - amd64,arm64
-          - amd64
-          - arm64
+        default: ''
 
 env:
-  CLAWX_VERSION: ${{ inputs.version || '0.3.2' }}
-  REPO: ValueCell-ai/ClawX
-  APPNAME: clawx
+  NODE_VERSION: '20'
 
 jobs:
+  # ── 构建 amd64 FPK ─────────────────────────────────────────────────
   build-amd64:
     runs-on: ubuntu-latest
-    if: contains(inputs.arch, 'amd64') || inputs.arch == ''
     steps:
-      - name: Checkout
+      - name: Checkout ClawX 源码
         uses: actions/checkout@v4
+        with:
+          repository: ValueCell-ai/ClawX
+          path: clawx-src
 
-      - name: Download ClawX amd64 AppImage
+      - name: 获取版本号
+        id: version
         run: |
-          wget -q "https://github.com/${{ env.REPO }}/releases/download/v${{ env.CLAWX_VERSION }}/ClawX-${{ env.CLAWX_VERSION }}-linux-x86_64.AppImage" -O ClawX.AppImage
-          chmod +x ClawX.AppImage
-
-      - name: Extract AppImage
-        run: |
-          mkdir -p extracted
-          ./ClawX.AppImage --appimage-extract > /dev/null 2>&1
-          mv squashfs-root extracted/
-
-      - name: Find frontend dist
-        run: |
-          echo "=== squashfs 内容 ==="
-          find extracted/squashfs-root -maxdepth 3 -type d | head -30
-          echo "=== dist 目录 ==="
-          find extracted/squashfs-root -name "dist" -type d 2>/dev/null
-
-      - name: Prepare FPK rootfs (amd64)
-        run: |
-          mkdir -p fpk-root/${{ env.APPNAME }}/data/{dist,openclaw,scripts}
-
-          # 复制前端文件
-          if [ -d "extracted/squashfs-root/dist" ]; then
-            cp -r extracted/squashfs-root/dist fpk-root/${{ env.APPNAME }}/data/
+          if [ "${{ inputs.version }}" != "" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
           else
-            # 从 AppImage 的 files 目录找
-            cp -r extracted/squashfs-root/files/dist fpk-root/${{ env.APPNAME }}/data/ 2>/dev/null || true
+            VERSION=$(node -p "require('./clawx-src/package.json').version")
+            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          fi
+          echo "构建版本: ${{ steps.version.outputs.VERSION }}"
+
+      - name: Checkout FPK 源码（fnpack 等配置文件）
+        uses: actions/checkout@v4
+        with:
+          path: fpk-src
+          sparse-checkout: |
+            fnpack.json
+            install.sh
+            uninstall.sh
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 安装 pnpm
+        run: npm install -g pnpm@9
+
+      - name: 安装 ClawX 依赖
+        working-directory: clawx-src
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建 ClawX 前端（仅 vite，不走 electron-builder）
+        working-directory: clawx-src
+        run: pnpm exec vite build
+
+      - name: 查看构建产物
+        run: |
+          echo "=== dist 内容 ==="
+          ls -lh clawx-src/dist/
+          echo "=== 大小 ==="
+          du -sh clawx-src/dist/
+
+      - name: 安装 bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+
+      - name: 安装 OpenClaw Core（amd64）
+        run: |
+          mkdir -p fpk-root/clawx/data/openclaw
+          cd fpk-root/clawx/data/openclaw
+          # 下载 bun 安装脚本
+          curl -fsSL https://bun.sh/install | bash
+          export BUN_INSTALL="$PWD/.bun"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+          echo "$BUN_INSTALL/bin" >> $GITHUB_PATH
+          bun install openclaw@latest 2>&1 | tail -5
+          echo "OpenClaw 安装完成"
+          ls node_modules/.bin/ | grep openclaw || echo "未找到 openclaw bin"
+
+      - name: 准备 FPK 目录结构
+        run: |
+          mkdir -p fpk-root/clawx/data/{dist,openclaw,config,scripts,logs}
+
+          # 复制前端构建产物
+          cp -r clawx-src/dist/* fpk-root/clawx/data/dist/
+
+          # 复制 OpenClaw（从 bun 安装目录）
+          BUN_MODULES="$(find fpk-root/clawx/data/openclaw -name 'node_modules' -type d | head -1)"
+          if [ -d "$BUN_MODULES/openclaw" ]; then
+            cp -r "$BUN_MODULES/openclaw" fpk-root/clawx/data/openclaw_core/
+            cp -r "$BUN_MODULES/.bin" fpk-root/clawx/data/openclaw_core/
+            echo "OpenClaw Core 复制完成"
+            ls fpk-root/clawx/data/openclaw_core/
           fi
 
-          # 复制 OpenClaw Core（如果有打包进去）
-          if [ -d "extracted/squashfs-root/openclaw" ]; then
-            cp -r extracted/squashfs-root/openclaw fpk-root/${{ env.APPNAME }}/data/
-          fi
+          # 复制 FPK 配置脚本
+          cp -r fpk-src/scripts/* fpk-root/clawx/data/scripts/
+          cp fpk-src/fnpack.json fpk-root/clawx/
+          cp fpk-src/install.sh fpk-root/clawx/
+          cp fpk-src/uninstall.sh fpk-root/clawx/
 
-          echo "=== FPK data 内容 ==="
-          ls -la fpk-root/${{ env.APPNAME }}/data/
-
-      - name: Download & bundle OpenClaw Core (amd64)
+      - name: 创建 OpenClaw 配置文件
         run: |
-          # 下载 Node.js 版 OpenClaw
-          cd fpk-root/${{ env.APPNAME }}/data
+          mkdir -p fpk-root/clawx/data/config
+          cat > fpk-root/clawx/data/config/openclaw.json << 'CONF'
+{
+  "gateway": {
+    "port": 18789,
+    "host": "0.0.0.0"
+  }
+}
+CONF
 
-          # 下载预编译的 OpenClaw Linux amd64
-          mkdir -p openclaw
-          cd openclaw
-
-          # 使用 ncc 打包版本或直接下载
-          curl -fsSL "https://github.com/openclaw/openclaw/releases/latest/download/openclaw-linux-x64.tar.gz" -o openclaw.tar.gz 2>/dev/null || \
-          curl -fsSL "https://registry.npmjs.org/openclaw/latest" -o package.json
-
-          # 尝试直接 npm 安装 openclaw 到本地
-          cd /tmp
-          mkdir openclaw_tmp && cd openclaw_tmp
-          npm install openclaw@latest --prefer-offline 2>&1 | tail -5 || true
-
-          # 复制 node_modules 中的核心文件
-          if [ -d "/tmp/openclaw_tmp/node_modules/openclaw" ]; then
-            cp -r /tmp/openclaw_tmp/node_modules/openclaw fpk-root/${{ env.APPNAME }}/data/openclaw_core/
-          fi
-
-          ls fpk-root/${{ env.APPNAME }}/data/openclaw/ 2>/dev/null || echo "openclaw 目录为空"
-
-      - name: Install system dependencies
+      - name: 创建启动脚本
         run: |
-          apt-get update -qq
-          apt-get install -y -qq python3 python3-pip > /dev/null 2>&1
-          pip3 install flask --quiet 2>/dev/null || true
-
-      - name: Create web server script
-        run: |
-          cat > fpk-root/${{ env.APPNAME }}/data/scripts/server.py << 'PYEOF'
-#!/usr/bin/env python3
-"""
-ClawX FPK 内置 Web 服务器
-监听本地端口，提供 ClawX 前端静态文件 + 反向代理 OpenClaw Gateway
-"""
-import http.server
-import socketserver
-import os
-import sys
-import threading
-import urllib.request
-import urllib.error
-import json
-from pathlib import Path
-
-PORT = int(os.environ.get('CLAWX_PORT', 5173))
-GATEWAY_PORT = int(os.environ.get('OPENCLAW_GATEWAY_PORT', 18789))
-DATA_DIR = Path(__file__).parent.parent.resolve()
-DIST_DIR = DATA_DIR / 'dist'
-
-# 静态文件服务器
-class StaticHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(DIST_DIR), **kwargs)
-
-    def do_GET(self):
-        # 静态资源
-        if os.path.exists(DIST_DIR / self.path.lstrip('/')):
-            return super().do_GET()
-
-        # API 代理 → OpenClaw Gateway
-        if self.path.startswith('/api/') or self.path.startswith('/ws') or 'gateway' in self.path.lower():
-            return self.proxy_gateway(self.path)
-
-        # SPA fallback
-        return super().do_GET()
-
-    def proxy_gateway(self, path):
-        """将请求代理到本地 Gateway"""
-        try:
-            target = f'http://localhost:{GATEWAY_PORT}{path}'
-            req = urllib.request.Request(target)
-            # 转发 headers
-            for h in ['Authorization', 'Content-Type', 'X-Requested-With']:
-                if h in self.headers:
-                    req.add_header(h, self.headers[h])
-            req.add_header('Host', f'localhost:{GATEWAY_PORT}')
-
-            try:
-                resp = urllib.request.urlopen(req, timeout=10)
-                body = resp.read()
-                self.send_response(resp.status)
-                for k, v in resp.headers.items():
-                    if k not in ('transfer-encoding', 'connection'):
-                        self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(body)
-            except urllib.error.HTTPError as e:
-                self.send_response(e.code)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': str(e)}).encode())
-        except Exception as ex:
-            self.send_response(502)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': f'Gateway unreachable: {ex}'}).encode())
-
-    def log_message(self, fmt, *args):
-        pass  # 静默日志
-
-if __name__ == '__main__':
-    os.chdir(DIST_DIR)
-    print(f"[ClawX] 前端静态服务: http://localhost:{PORT}")
-    print(f"[ClawX] Gateway 代理: http://localhost:{GATEWAY_PORT}")
-    with socketserver.TCPServer(("", PORT), StaticHandler) as httpd:
-        httpd.serve_forever()
-PYEOF
-          chmod +x fpk-root/${{ env.APPNAME }}/data/scripts/server.py
-
-      - name: Create start script
-        run: |
-          cat > fpk-root/${{ env.APPNAME }}/data/scripts/start.sh << 'SHEOF'
+          cat > fpk-root/clawx/data/scripts/start.sh << 'SHEOF'
 #!/bin/bash
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$(dirname "$SCRIPT_DIR")"
 APP_DIR="$(dirname "$DATA_DIR")"
-CONFIG_DIR="$APP_DIR/config"
+LOG_DIR="$DATA_DIR/logs"
+mkdir -p "$LOG_DIR"
 
-# 读取 fnpack.json 获取配置
-GATEWAY_PORT=$(python3 -c "import json; d=json.load(open('$APP_DIR/fnpack.json')); print(d.get('openclaw',{}).get('gateway_port',18789))" 2>/dev/null || echo 18789)
-CLAWX_PORT=$(python3 -c "import json; d=json.load(open('$APP_DIR/fnpack.json')); print(d.get('runtime',{}).get('port',5173))" 2>/dev/null || echo 5173)
+# 读取配置
+GATEWAY_PORT=$(python3 -c "import json; print(json.load(open('$APP_DIR/fnpack.json')).get('runtime',{}).get('gateway_port',18789))" 2>/dev/null || echo 18789)
+CLAWX_PORT=$(python3 -c "import json; print(json.load(open('$APP_DIR/fnpack.json')).get('runtime',{}).get('port',5173))" 2>/dev/null || echo 5173)
+OPENCLAW_DIR="$DATA_DIR/openclaw_core"
 
-export OPENCLAW_GATEWAY_PORT=$GATEWAY_PORT
-export CLAWX_PORT=$CLAWX_PORT
-export CLAWX_DATA_DIR=$DATA_DIR
+export GATEWAY_PORT CLAWX_PORT
 
-# 启动 OpenClaw Gateway（如未运行）
+echo "[ClawX] 数据目录: $DATA_DIR"
+echo "[ClawX] Gateway 端口: $GATEWAY_PORT"
+echo "[ClawX] Web 端口: $CLAWX_PORT"
+
+# 启动 OpenClaw Gateway
 if ! curl -sf "http://localhost:$GATEWAY_PORT/health" > /dev/null 2>&1; then
     echo "[ClawX] 启动 OpenClaw Gateway :$GATEWAY_PORT ..."
-    cd "$DATA_DIR/openclaw_core"
-    nohup node ./dist/index.js gateway start > "$DATA_DIR/logs/gateway.log" 2>&1 &
+    if [ -d "$OPENCLAW_DIR" ]; then
+        cd "$OPENCLAW_DIR"
+        nohup node node_modules/openclaw/dist/index.js gateway start > "$LOG_DIR/gateway.log" 2>&1 &
+    else
+        echo "[ClawX] 警告: 未找到 OpenClaw Core，请先安装 OpenClaw"
+    fi
     sleep 3
 fi
 
 # 启动 Web 服务器
 echo "[ClawX] 启动 Web 服务 :$CLAWX_PORT ..."
-nohup python3 "$SCRIPT_DIR/server.py" > "$DATA_DIR/logs/web.log" 2>&1 &
+nohup python3 "$SCRIPT_DIR/server.py" > "$LOG_DIR/web.log" 2>&1 &
 
-echo "[ClawX] 启动完成，请访问 http://localhost:$CLAWX_PORT"
+echo ""
+echo "=========================================="
+echo " ClawX 启动完成！"
+echo " 请访问: http://localhost:$CLAWX_PORT"
+echo "=========================================="
 SHEOF
-          chmod +x fpk-root/${{ env.APPNAME }}/data/scripts/start.sh
+          chmod +x fpk-root/clawx/data/scripts/start.sh
 
-      - name: Create install / uninstall scripts
+      - name: 创建 Web 服务器
         run: |
-          # 安装脚本
-          cat > fpk-root/${{ env.APPNAME }}/install.sh << 'EOF'
-#!/bin/bash
-echo "[ClawX FPK] 正在安装..."
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$APP_DIR/data"
-LOG_DIR="$DATA_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-# 创建 OpenClaw 配置
-mkdir -p "$APP_DIR/config"
-cat > "$APP_DIR/config/openclaw.json" << 'CONF'
-{
-  "gateway": {
-    "port": 18789,
-    "host": "0.0.0.0"
-  },
-  "plugins": {
-    "dir": "plugins"
-  }
-}
-CONF
-
-echo "[ClawX FPK] 安装完成！"
-echo "首次使用请先运行 data/scripts/start.sh 启动服务"
-EOF
-          chmod +x fpk-root/${{ env.APPNAME }}/install.sh
-
-          # 卸载脚本
-          cat > fpk-root/${{ env.APPNAME }}/uninstall.sh << 'EOF'
-#!/bin/bash
-echo "[ClawX FPK] 正在卸载..."
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-pkill -f "clawx.*server.py" 2>/dev/null || true
-pkill -f "openclaw.*gateway" 2>/dev/null || true
-echo "[ClawX FPK] 卸载完成"
-EOF
-          chmod +x fpk-root/${{ env.APPNAME }}/uninstall.sh
-
-      - name: Package FPK (amd64)
-        run: |
-          cd fpk-root
-          # FPK = tar.gz 压缩包
-          tar -czvf "${{ env.APPNAME }}-amd64-${{ env.CLAWX_VERSION }}.fpk" "${{ env.APPNAME }}/"
-          echo "=== FPK 内容 ==="
-          tar -tvf "${{ env.APPNAME }}-amd64-${{ env.CLAWX_VERSION }}.fpk" | head -20
-          echo "=== FPK 大小 ==="
-          du -sh "${{ env.APPNAME }}-amd64-${{ env.CLAWX_VERSION }}.fpk"
-
-      - name: Upload FPK artifact (amd64)
-        uses: actions/upload-artifact@v4
-        with:
-          name: clawx-fpk-amd64-v${{ env.CLAWX_VERSION }}
-          path: fpk-root/${{ env.APPNAME }}-amd64-${{ env.CLAWX_VERSION }}.fpk
-          retention-days: 30
-
-  # ── ARM64 构建（相同流程，仅下载不同） ──────────────────────────────
-  build-arm64:
-    runs-on: ubuntu-latest
-    if: contains(inputs.arch, 'arm64') || inputs.arch == ''
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download ClawX arm64 AppImage
-        run: |
-          wget -q "https://github.com/${{ env.REPO }}/releases/download/v${{ env.CLAWX_VERSION }}/ClawX-${{ env.CLAWX_VERSION }}-linux-arm64.AppImage" -O ClawX.AppImage
-          chmod +x ClawX.AppImage
-
-      - name: Extract AppImage
-        run: |
-          mkdir -p extracted
-          ./ClawX.AppImage --appimage-extract > /dev/null 2>&1
-          mv squashfs-root extracted/
-
-      - name: Prepare FPK rootfs (arm64)
-        run: |
-          mkdir -p fpk-root/${{ env.APPNAME }}/data/{dist,openclaw,scripts}
-
-          if [ -d "extracted/squashfs-root/dist" ]; then
-            cp -r extracted/squashfs-root/dist fpk-root/${{ env.APPNAME }}/data/
-          fi
-
-          if [ -d "extracted/squashfs-root/openclaw" ]; then
-            cp -r extracted/squashfs-root/openclaw fpk-root/${{ env.APPNAME }}/data/
-          fi
-
-      - name: Install Python
-        run: |
-          apt-get update -qq && apt-get install -y -qq python3 > /dev/null 2>&1
-
-      - name: Copy scripts
-        run: |
-          # 使用 amd64 构建 artifacts 中的脚本（相同内容）
-          # 直接创建脚本（同上）
-          mkdir -p fpk-root/${{ env.APPNAME }}/data/scripts
-
-          cat > fpk-root/${{ env.APPNAME }}/data/scripts/start.sh << 'SHEOF'
-#!/bin/bash
-set -e
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="$(dirname "$SCRIPT_DIR")"
-APP_DIR="$(dirname "$DATA_DIR")"
-GATEWAY_PORT=18789
-CLAWX_PORT=5173
-export OPENCLAW_GATEWAY_PORT=$GATEWAY_PORT
-export CLAWX_PORT=$CLAWX_PORT
-export CLAWX_DATA_DIR=$DATA_DIR
-
-mkdir -p "$DATA_DIR/logs"
-
-if ! curl -sf "http://localhost:$GATEWAY_PORT/health" > /dev/null 2>&1; then
-    echo "[ClawX] 启动 OpenClaw Gateway :$GATEWAY_PORT ..."
-    [ -d "$DATA_DIR/openclaw_core" ] && {
-        cd "$DATA_DIR/openclaw_core"
-        nohup node ./dist/index.js gateway start > "$DATA_DIR/logs/gateway.log" 2>&1 &
-        sleep 3
-    }
-fi
-
-echo "[ClawX] 启动 Web 服务 :$CLAWX_PORT ..."
-nohup python3 "$SCRIPT_DIR/server.py" > "$DATA_DIR/logs/web.log" 2>&1 &
-echo "[ClawX] 启动完成，请访问 http://localhost:$CLAWX_PORT"
-SHEOF
-          chmod +x fpk-root/${{ env.APPNAME }}/data/scripts/start.sh
-
-          cat > fpk-root/${{ env.APPNAME }}/data/scripts/server.py << 'PYEOF'
+          cat > fpk-root/clawx/data/scripts/server.py << 'PYEOF'
 #!/usr/bin/env python3
-import http.server, socketserver, os, urllib.request, urllib.error, json
+"""ClawX FPK 内置 Web 服务器
+  静态服务 ClawX 前端 + 反向代理 OpenClaw Gateway
+"""
+import http.server
+import socketserver
+import os
+import urllib.request
+import urllib.error
+import json
 from pathlib import Path
 
-PORT = int(os.environ.get('CLAWX_PORT', 5173))
-GATEWAY_PORT = int(os.environ.get('OPENCLAW_GATEWAY_PORT', 18789))
-DATA_DIR = Path(__file__).parent.parent.resolve()
-DIST_DIR = DATA_DIR / 'dist'
+PORT     = int(os.environ.get('CLAWX_PORT', 5173))
+GW_PORT  = int(os.environ.get('GATEWAY_PORT', 18789))
+SCRIPT_DIR = Path(__file__).parent.resolve()
+DATA_DIR   = SCRIPT_DIR.parent
+DIST_DIR   = DATA_DIR / 'dist'
 
-class StaticHandler(http.server.SimpleHTTPRequestHandler):
+class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(DIST_DIR), **kwargs)
 
     def do_GET(self):
-        if os.path.exists(DIST_DIR / self.path.lstrip('/')):
+        path = self.path.split('?')[0]
+        # 静态文件
+        if (DIST_DIR / path.lstrip('/')).is_file():
             return super().do_GET()
-        if self.path.startswith('/api/') or self.path.startswith('/ws'):
-            return self.proxy_gateway(self.path)
+        # Gateway 健康检查
+        if path == '/health' or path == '/api/health':
+            return self.proxy('/health')
+        # API / WebSocket 代理
+        if path.startswith('/api/') or path.startswith('/ws') or path.startswith('/session') or path.startswith('/channel') or path.startswith('/agent'):
+            return self.proxy(path)
+        # 首页 → 重定向到 ClawX
+        if path == '/' or path == '':
+            self.send_response(302)
+            self.send_header('Location', '/index.html')
+            self.end_headers()
+            return
+        # SPA fallback
         return super().do_GET()
 
-    def proxy_gateway(self, path):
+    def proxy(self, path):
         try:
-            target = f'http://localhost:{GATEWAY_PORT}{path}'
+            target = f'http://localhost:{GW_PORT}{path}'
             req = urllib.request.Request(target)
-            for h in ['Authorization', 'Content-Type', 'X-Requested-With']:
+            for h in ['Authorization', 'Content-Type', 'X-Requested-With', 'Cookie']:
                 if h in self.headers:
                     req.add_header(h, self.headers[h])
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=15)
             body = resp.read()
             self.send_response(resp.status)
             for k, v in resp.headers.items():
-                if k not in ('transfer-encoding', 'connection'):
+                if k.lower() not in ('transfer-encoding', 'connection', 'content-encoding'):
                     self.send_header(k, v)
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
         except urllib.error.HTTPError as e:
+            body = e.read()
             self.send_response(e.code)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
+            self.wfile.write(body)
         except Exception as ex:
             self.send_response(502)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps({'error': str(ex)}).encode())
 
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.end_headers()
+
     def log_message(self, fmt, *args):
-        pass
+        pass  # 静默日志
+
+    def guess_type(self, path):
+        # 确保 .js 文件以 application/javascript 发送
+        base = os.path.splitext(path)[0]
+        ext  = os.path.splitext(path)[1]
+        if ext == '.js':
+            return 'application/javascript'
+        return super().guess_type(path)
 
 if __name__ == '__main__':
     os.chdir(DIST_DIR)
-    print(f"[ClawX] 前端服务: http://localhost:{PORT}")
-    with socketserver.TCPServer(("", PORT), StaticHandler) as httpd:
+    print(f"[ClawX] Web 服务  → http://localhost:{PORT}")
+    print(f"[ClawX] Gateway   → http://localhost:{GW_PORT}")
+    with socketserver.TCPServer(('', PORT), Handler) as httpd:
         httpd.serve_forever()
 PYEOF
-          chmod +x fpk-root/${{ env.APPNAME }}/data/scripts/server.py
+          chmod +x fpk-root/clawx/data/scripts/server.py
 
-          cat > fpk-root/${{ env.APPNAME }}/install.sh << 'EOF'
-#!/bin/bash
-echo "[ClawX FPK] 正在安装..."
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-mkdir -p "$APP_DIR/config" "$APP_DIR/data/logs"
-cat > "$APP_DIR/config/openclaw.json" << 'CONF'
-{"gateway":{"port":18789,"host":"0.0.0.0"},"plugins":{"dir":"plugins"}}
-CONF
-echo "[ClawX FPK] 安装完成"
-EOF
-          chmod +x fpk-root/${{ env.APPNAME }}/install.sh
-
-          cat > fpk-root/${{ env.APPNAME }}/uninstall.sh << 'EOF'
-#!/bin/bash
-pkill -f "clawx.*server.py" 2>/dev/null || true
-pkill -f "openclaw.*gateway" 2>/dev/null || true
-echo "[ClawX FPK] 卸载完成"
-EOF
-          chmod +x fpk-root/${{ env.APPNAME }}/uninstall.sh
-
-      - name: Package FPK (arm64)
+      - name: 打包 FPK（amd64）
+        id: package-amd64
         run: |
           cd fpk-root
-          tar -czvf "${{ env.APPNAME }}-arm64-${{ env.CLAWX_VERSION }}.fpk" "${{ env.APPNAME }}/"
-          du -sh "${{ env.APPNAME }}-arm64-${{ env.CLAWX_VERSION }}.fpk"
+          tar -czvf "clawx-amd64-$(cat /tmp/version).fpk" clawx/
+          FPK_SIZE=$(du -sh "clawx-amd64-$(cat /tmp/version).fpk" | cut -f1)
+          echo "FPK 大小: $FPK_SIZE"
+          echo "fpk_name=clawx-amd64-$(cat /tmp/version).fpk" >> $GITHUB_OUTPUT
 
-      - name: Upload FPK artifact (arm64)
+      - name: Upload FPK artifact（amd64）
         uses: actions/upload-artifact@v4
         with:
-          name: clawx-fpk-arm64-v${{ env.CLAWX_VERSION }}
-          path: fpk-root/${{ env.APPNAME }}-arm64-${{ env.CLAWX_VERSION }}.fpk
-          retention-days: 30
+          name: clawx-fpk-amd64
+          path: fpk-root/clawx-amd64-*.fpk
+          retention-days: 14
 
-  # ── 创建 Release（仅在 tag push 时触发） ────────────────────────────
-  release:
-    needs: [build-amd64, build-arm64]
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── 构建 arm64 FPK ─────────────────────────────────────────────────
+  build-arm64:
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Checkout ClawX 源码
+        uses: actions/checkout@v4
+        with:
+          repository: ValueCell-ai/ClawX
+          path: clawx-src
+
+      - name: 获取版本号
+        id: version
+        run: |
+          if [ "${{ inputs.version }}" != "" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(node -p "require('./clawx-src/package.json').version")
+            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout FPK 配置
+        uses: actions/checkout@v4
+        with:
+          path: fpk-src
+          sparse-checkout: |
+            fnpack.json
+            install.sh
+            uninstall.sh
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 安装 pnpm
+        run: npm install -g pnpm@9
+
+      - name: 安装依赖 & 构建前端
+        working-directory: clawx-src
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec vite build
+
+      - name: 安装 bun（linux-arm64）
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> $GITHUB_PATH
+
+      - name: 安装 OpenClaw Core（arm64）
+        run: |
+          mkdir -p fpk-root/clawx/data/openclaw
+          cd fpk-root/clawx/data/openclaw
+          curl -fsSL https://bun.sh/install | BUN_INSTALL="$PWD/.bun" bash
+          export PATH="$PWD/.bun/bin:$PATH"
+          bun install openclaw@latest 2>&1 | tail -3
+          BUN_MODULES="$(find . -name 'node_modules' -type d | head -1)"
+          [ -d "$BUN_MODULES/openclaw" ] && cp -r "$BUN_MODULES/openclaw" ../openclaw_core/ && cp -r "$BUN_MODULES/.bin" ../openclaw_core/
+
+      - name: 准备 FPK（arm64）
+        run: |
+          mkdir -p fpk-root/clawx/data/{dist,openclaw_core,config,scripts,logs}
+          cp -r clawx-src/dist/* fpk-root/clawx/data/dist/
+          cp -r fpk-src/scripts/* fpk-root/clawx/data/scripts/
+          cp fpk-src/fnpack.json fpk-root/clawx/
+          cp fpk-src/install.sh fpk-root/clawx/
+          cp fpk-src/uninstall.sh fpk-root/clawx/
+          mkdir -p fpk-root/clawx/data/config
+          cat > fpk-root/clawx/data/config/openclaw.json << 'CONF'
+{"gateway":{"port":18789,"host":"0.0.0.0"}}
+CONF
+          chmod +x fpk-root/clawx/data/scripts/*.sh fpk-root/clawx/data/scripts/*.py
+
+      - name: 打包 FPK（arm64）
+        run: |
+          cd fpk-root
+          tar -czvf "clawx-arm64-${{ steps.version.outputs.VERSION }}.fpk" clawx/
+          echo "fpk_name=clawx-arm64-${{ steps.version.outputs.VERSION }}.fpk" >> $GITHUB_OUTPUT
+
+      - name: Upload FPK artifact（arm64）
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawx-fpk-arm64
+          path: fpk-root/clawx-arm64-*.fpk
+          retention-days: 14
+
+  # ── 汇总 & 发布 Release ─────────────────────────────────────────────
+  release:
+    needs: [build-amd64, build-arm64]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all FPKs
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
+      - name: 列出构建产物
+        run: |
+          find artifacts -name "*.fpk" -exec ls -lh {} \;
+
+      - name: 获取版本
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: 创建 / 更新 Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}
           name: ClawX FPK v${{ github.ref_name }}
-          body: |
-            ## ClawX FPK 安装包
-
-            支持飞牛 fnOS（amd64 / arm64 双架构）
-
-            ### 安装方法
-            1. 下载对应的 `.fpk` 文件
-            2. 上传至飞牛 NAS
-            3. 在应用中心选择「从文件安装」
-            4. 安装完成后在桌面找到 ClawX 图标点击启动
-
-            ### 版本
-            ClawX 前端: v${{ env.CLAWX_VERSION }}
+          generate_release_notes: true
+          draft: false
           files: |
             artifacts/**/*.fpk
         env:
