@@ -1,0 +1,21 @@
+# FPK 构建产物
+*.fpk
+*.AppImage
+*.deb
+*.rpm
+
+# 构建临时文件
+extracted/
+squashfs-root/
+fpk-root/
+openclaw_tmp/
+node_modules/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
