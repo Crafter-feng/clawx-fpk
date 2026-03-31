@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [workflow_dispatch]
   workflow_dispatch:
     inputs:
       version:
